@@ -28,7 +28,9 @@ import (
 
 const gcsWriteTimeout = 3600
 
-var logger = logrus.New()
+var (
+	logger = logrus.New()
+)
 
 func main() {
 	port := os.Getenv("PORT")
@@ -85,7 +87,7 @@ func Handler(args Args) error {
 			logger.WithField("f", f).Info("forwarding")
 
 			src := S3Ptr{
-				Region: falconAwsRegion,
+				Region: args.FalconAwsRegion,
 				Bucket: msg.Bucket,
 				Key:    f.Path,
 				credential: &awsCredential{
@@ -117,8 +119,6 @@ func Handler(args Args) error {
 	return err
 }
 
-var falconAwsRegion = "us-west-1"
-
 // BuildArgs builds argument of receiver from environment variables.
 func BuildArgs() (Args, error) {
 	return Args{
@@ -126,6 +126,7 @@ func BuildArgs() (Args, error) {
 		GCSPrefix:       os.Getenv("GCS_PREFIX"),
 		GCSRegion:       os.Getenv("GCS_REGION"),
 		SqsURL:          os.Getenv("SQS_URL"),
+		FalconAwsRegion: os.Getenv("FALCON_AWS_REGION"),
 		FalconAwsKey:    os.Getenv("FALCON_AWS_KEY"),
 		FalconAwsSecret: os.Getenv("FALCON_AWS_SECRET"), // Get value from Secret Manager via berglas
 	}, nil
@@ -136,6 +137,7 @@ type Args struct {
 	GCSPrefix       string
 	GCSRegion       string
 	SqsURL          string
+	FalconAwsRegion string
 	FalconAwsKey    string `json:"falcon_aws_key"`
 	FalconAwsSecret string `json:"falcon_aws_secret"`
 }
