@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -11,35 +13,52 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
 
-	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
 	"github.com/aws/aws-sdk-go/service/sqs"
 	"github.com/pkg/errors"
 
 	"github.com/sirupsen/logrus"
 
+	"cloud.google.com/go/storage"
+
 	_ "github.com/GoogleCloudPlatform/berglas/pkg/auto"
 )
 
-var logger = logrus.New()
+const gcsWriteTimeout = 3600
+
+var (
+	logger = logrus.New()
+)
 
 func main() {
+	port := os.Getenv("PORT")
+
 	logger.SetFormatter(&logrus.JSONFormatter{})
 	logger.SetLevel(logrus.InfoLevel)
-	lambda.Start(handleRequest)
+
+	http.HandleFunc("/", handleRequest)
+	http.ListenAndServe(":"+port, nil)
 }
 
-func handleRequest(ctx context.Context, event struct{}) error {
+func handleRequest(w http.ResponseWriter, req *http.Request) {
 	args, err := BuildArgs()
 	if err != nil {
-		return err
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+		return
 	}
 
-	return Handler(args)
+	err = Handler(args)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(http.StatusText(http.StatusOK)))
 }
 
 type awsCredential struct {
@@ -54,6 +73,12 @@ type S3Ptr struct {
 	credential *awsCredential
 }
 
+type GCSPtr struct {
+	Region string
+	Bucket string
+	Key    string
+}
+
 func Handler(args Args) error {
 	forwardMessage := func(msg *FalconMessage) error {
 		t := time.Unix(int64(msg.Timestamp/1000), 0)
@@ -62,7 +87,7 @@ func Handler(args Args) error {
 			logger.WithField("f", f).Info("forwarding")
 
 			src := S3Ptr{
-				Region: falconAwsRegion,
+				Region: args.FalconAwsRegion,
 				Bucket: msg.Bucket,
 				Key:    f.Path,
 				credential: &awsCredential{
@@ -70,11 +95,11 @@ func Handler(args Args) error {
 					secret: args.FalconAwsSecret,
 				},
 			}
-			dst := S3Ptr{
-				Region: args.S3Region,
-				Bucket: args.S3Bucket,
+			dst := GCSPtr{
+				Region: args.GCSRegion,
+				Bucket: args.GCSBucket,
 				Key: strings.Join([]string{
-					args.S3Prefix,
+					args.GCSPrefix,
 					t.Format("2006/01/02/15/"),
 					f.Path,
 				}, ""),
@@ -82,6 +107,7 @@ func Handler(args Args) error {
 
 			err := ForwardS3File(src, dst)
 			if err != nil {
+				logger.Warn("Failed to forward: %s", err.Error())
 				return err
 			}
 		}
@@ -93,54 +119,25 @@ func Handler(args Args) error {
 	return err
 }
 
-var falconAwsRegion = "us-west-1"
-
-func getSecretValues(secretArn string, values interface{}) error {
-	// sample: arn:aws:secretsmanager:ap-northeast-1:1234567890:secret:mytest
-	arn := strings.Split(secretArn, ":")
-	if len(arn) != 7 {
-		return errors.New(fmt.Sprintf("Invalid SecretsManager ARN format: %s", secretArn))
-	}
-	region := arn[3]
-
-	ssn := session.Must(session.NewSession(&aws.Config{
-		Region: aws.String(region),
-	}))
-	mgr := secretsmanager.New(ssn)
-
-	result, err := mgr.GetSecretValue(&secretsmanager.GetSecretValueInput{
-		SecretId: aws.String(secretArn),
-	})
-
-	if err != nil {
-		return errors.Wrap(err, "Fail to retrieve secret values")
-	}
-
-	err = json.Unmarshal([]byte(*result.SecretString), values)
-	if err != nil {
-		return errors.Wrap(err, "Fail to parse secret values as JSON")
-	}
-
-	return nil
-}
-
 // BuildArgs builds argument of receiver from environment variables.
 func BuildArgs() (Args, error) {
 	return Args{
-		S3Bucket:        os.Getenv("S3_BUCKET"),
-		S3Prefix:        os.Getenv("S3_PREFIX"),
-		S3Region:        os.Getenv("S3_REGION"),
+		GCSBucket:       os.Getenv("GCS_BUCKET"),
+		GCSPrefix:       os.Getenv("GCS_PREFIX"),
+		GCSRegion:       os.Getenv("GCS_REGION"),
 		SqsURL:          os.Getenv("SQS_URL"),
+		FalconAwsRegion: os.Getenv("FALCON_AWS_REGION"),
 		FalconAwsKey:    os.Getenv("FALCON_AWS_KEY"),
 		FalconAwsSecret: os.Getenv("FALCON_AWS_SECRET"), // Get value from Secret Manager via berglas
 	}, nil
 }
 
 type Args struct {
-	S3Bucket        string
-	S3Prefix        string
-	S3Region        string
+	GCSBucket       string
+	GCSPrefix       string
+	GCSRegion       string
 	SqsURL          string
+	FalconAwsRegion string
 	FalconAwsKey    string `json:"falcon_aws_key"`
 	FalconAwsSecret string `json:"falcon_aws_secret"`
 }
@@ -249,7 +246,7 @@ func ReceiveMessages(sqsURL, awsKey, awsSecret string, msgHandler func(msg *Falc
 	return nil
 }
 
-func ForwardS3File(src, dst S3Ptr) error {
+func ForwardS3File(src S3Ptr, dst GCSPtr) error {
 	cfg := aws.Config{Region: aws.String(src.Region)}
 	if src.credential != nil {
 		cfg.Credentials = credentials.NewStaticCredentials(src.credential.key,
@@ -272,17 +269,23 @@ func ForwardS3File(src, dst S3Ptr) error {
 	}
 
 	// Upload
-	dstSsn := session.Must(session.NewSession(&aws.Config{
-		Region: aws.String(dst.Region),
-	}))
-	uploader := s3manager.NewUploader(dstSsn)
-	_, err = uploader.Upload(&s3manager.UploadInput{
-		Bucket: aws.String(dst.Bucket),
-		Key:    aws.String(dst.Key),
-		Body:   getResult.Body,
-	})
-	if err != nil {
-		return errors.Wrap(err, "Fail to upload data to your bucket")
+	return writeGCS(dst.Bucket, dst.Key, getResult.Body)
+}
+
+func writeGCS(bucket, key string, data io.Reader) error {
+	ctx := context.Background()
+	client, err := storage.NewClient(ctx)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second*gcsWriteTimeout)
+	defer cancel()
+	writer := client.Bucket(bucket).Object(key).NewWriter(ctx)
+
+	if _, err = io.Copy(writer, data); err != nil {
+		return fmt.Errorf("io.Copy: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("Writer.Close: %v", err)
 	}
 
 	return nil
